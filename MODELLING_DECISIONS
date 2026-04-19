@@ -1,0 +1,94 @@
+# Modeling Decisions and Rationale
+
+This document walks through every non-obvious choice in the modeling pipeline, why it was made, and what the alternative would have been.
+
+## Data preprocessing
+
+### Why chunked loading instead of one-shot pandas read
+The combined 2019Q1 file is 3GB on disk with 110 columns and 11.4M rows. A naive pandas read would expand in memory to roughly 12-18GB because object dtypes and default float64 are memory-inefficient. Chunked loading at 300K rows per chunk, combined with explicit dtype casting (float32 for numerics, category for low-cardinality strings, int64 only for loan_id), keeps peak memory under 2.5GB.
+
+### Why only 17 columns kept out of 110
+The Fannie file has fields for every possible event (foreclosure costs, property preservation, asset recovery, repurchase proceeds, etc.) most of which populate only on terminated loans and aren't needed for default or prepay prediction. The 17 columns kept cover origination attributes (FICO, LTV, DTI, rate, purpose, property type, occupancy, state, MSA) plus the monthly reporting fields needed for time-varying analysis (UPB, delinquency, zero-balance code, modification flag).
+
+### Why fill first-six-months UPB with origination UPB
+Fannie intentionally blanks the current UPB field for the first six months of each loan. The unpaid balance in month 1-6 is extremely close to origination UPB because amortization is slow early on, so filling with orig_upb is a reasonable approximation. This matches standard Fannie academic research practice.
+
+## Outcome classification
+
+### Why this specific default / prepay / censored / current split
+Follows Fannie's zero-balance code dictionary directly:
+- ZBC 1 = prepaid/matured → prepaid
+- ZBC 2, 3, 9, 15 = third-party sale, short sale, deed-in-lieu/REO, note sale → default (all represent credit loss events)
+- ZBC 6, 16 = repurchased, reperforming loan sale → censored (Fannie bought loan back for administrative reasons, not a clean outcome)
+- Modified loans → censored at first modification month (terms changed, so future behavior reflects new loan, not original)
+- No ZBC ever populated → current (still active)
+
+### Why 80% prepay and 0.17% default rate
+2019-vintage loans experienced the COVID rate collapse in 2020-21 and the refi wave that followed. By 2024 roughly four out of five had prepaid. Default rate is low because 2019 underwriting was strong (post-2008 tightening) and COVID forbearance programs absorbed most distress cases that would have historically defaulted.
+
+## Time-varying feature construction
+
+### Why spread = orig_rate - 4-week moving average of national rate
+Matches the convention used in academic mortgage research and the OFHEO/FHFA approach. The 4-week smoothing removes weekly noise in Freddie Mac's PMMS (MORTGAGE30US) series. Month-end snapshot merged on origination month lets each loan carry a constant spread value through its life.
+
+### Why cvr = orig_rate / current_national_rate rather than the difference
+Research convention (Richard and Roll 1989) shows ratio is more stable across rate regimes than difference. A 200bp gap means different things when rates are 4% vs when rates are 8%. Ratio normalizes.
+
+### Why piecewise-linear cvr decomposition (cvr_itm and cvr_otm)
+A single linear cvr variable assumes the relationship between refi incentive and prepayment is symmetric and linear, which is wrong. Empirically prepayment behavior is highly asymmetric: no response below cvr=1, then a steep ramp up. Splitting into cvr_itm = max(cvr-1, 0) and cvr_otm = max(1-cvr, 0) lets the model learn different coefficients for each regime. This is essentially a two-piece spline and approximates the S-curve shape that industry models impose structurally. The improvement in prepay concordance from 0.63 (linear cvr) to 0.71 (piecewise) validated this choice.
+
+### Why current_ltv uses forward-filled UPB instead of the reported current_upb
+Data leakage fix. Fannie sets current_upb to zero on the termination row (the row where zero_balance_code populates). Using the reported current_upb directly would create a feature that equals zero on exactly the rows where events happen, leaking the event indicator into the covariates. Concordance went to 1.00 in an early version because of this bug. Forward-filling the last valid UPB through termination rows removes the leakage and produces a current_ltv that reflects the actual economic leverage at the time of the event.
+
+## Cox proportional hazards
+
+### Why Cox PH rather than parametric survival (Weibull, log-normal)
+Cox is non-parametric in the baseline hazard, so we don't have to commit to a functional form for how default risk evolves with loan age. Weibull assumes monotonic hazard, log-normal assumes unimodal hazard, but mortgage default typically has a multi-peaked hazard (low early, peak around years 2-5, declining after). Cox handles this automatically via the Breslow or Efron baseline estimator.
+
+### Why cause-specific competing risks instead of joint estimation
+Cause-specific (fit default with prepay as censoring, fit prepay with default as censoring) is correct when the two competing risks are conditionally independent given covariates. An and Qi (2012) showed this produces near-identical estimates to full joint estimation on FNMA data, with dramatically simpler code. Joint estimation with mass-point approximation for unobserved heterogeneity would require custom optimization beyond the standard lifelines API.
+
+### Why oltv coefficient flips negative in default v3 when current_ltv is added
+Survivorship bias. Conditional on current_ltv trajectory, loans that originated at high LTV and survived to the current observation point are self-selected as lower-risk (they've already proven they can handle payments). So oltv absorbs this selection effect, producing a negative coefficient that has no direct economic interpretation as "high original LTV causes less default." Prof. Hsieh's course notes flag this exact pattern.
+
+### Why 20% sample instead of full 11M rows
+Coefficient estimates are near-identical between 20% sample and full data once you have 100+ events, because Cox partial likelihood is dominated by event observations, not censored observations. Sampling let iterations run in 3-5 seconds instead of 3-8 minutes, enabling fast model comparison. A final full-data fit on the winning model would tighten standard errors but not meaningfully change coefficients.
+
+## Logistic regression
+
+### Why monthly logistic as an alternative to Cox
+This is the functional form most credit teams use in practice for CRT/CAS deal analytics. Each loan-month is modeled as a Bernoulli trial with P(default_t | features_t) = logit-inverse of a linear combination. Advantages over Cox: faster to score forward, easier to handle time-varying coefficients, cleaner for simulation-based pricing workflows. Disadvantages: treats loan-months as independent when they aren't, and doesn't explicitly model survival.
+
+### Why class_weight='balanced'
+Default is 0.005% per loan-month. A naive logistic would predict "no default" everywhere and achieve 99.995% accuracy while being useless. Class weighting multiplies loss on positive examples by (N_neg / N_pos), forcing the model to actually separate classes.
+
+### Why drop oltv in the final logistic (Fix A)
+Ran into near-perfect collinearity with current_ltv, producing degenerate coefficients (oltv = -8.1, current_ltv = +9.7) that canceled out. L1 and L2 regularization across a range of strengths all failed to break the degeneracy because the two variables are algebraically linked via the implied home value calculation. Dropping oltv kept current_ltv with a stable coefficient and produced out-of-sample AUC of 0.876 on Q2, versus the degenerate variant that would have crashed out of sample.
+
+### Why loan-level train/test split instead of row-level
+Row-level splitting would put the same loan in both train and test, since every loan contributes ~33 monthly rows. The model would essentially memorize loan identities and test AUC would be meaningless. Loan-level splitting ensures test loans are truly unseen.
+
+## S-curve prepayment model
+
+### Why a structural functional form instead of pure statistical
+Industry prepay models (ADCo, Yield Book, Polypaths) impose the turnover + refi-incentive + burnout structure because it encodes 40 years of observed prepayment behavior and makes coefficients interpretable to traders. The cost is lower in-sample AUC; the benefit is that estimated parameters are economically meaningful and generalization is better (confirmed in the Q2 results: S-curve AUC actually rose 0.66 → 0.67 out of sample while Cox prepay dropped 0.71 → 0.65).
+
+### Why the specific functional form: turnover + refi_amp × logistic(slope × (cvr_itm - center)) × (1 - burnout)
+- Turnover captures baseline moving/relocation prepayment independent of incentive
+- Logistic S-curve on cvr_itm captures the sharp behavioral shift when refi becomes profitable
+- Multiplicative structure with (1 - burnout) lets burnout progressively dampen the refi response
+- All parameters have direct economic interpretation
+
+### Why burnout came out with wrong sign
+The specified burnout term `burnout = 1 - exp(-decay × age × cvr)` assumes burnout grows with age times incentive. In the 2019 data the empirical curve bends down at very high cvr_itm regardless of age, which suggests pool-level heterogeneity (borrowers still at high cvr_itm are the ones who can't refi due to credit issues) rather than age-driven burnout. The simple model can't capture this and the optimizer set decay near zero. Production models handle this with pool-level cumulative incentive tracking, which requires loan-level historical incentive paths.
+
+## Out-of-sample validation
+
+### Why 2019Q2 as the holdout instead of a random split within Q1
+Q2 tests whether the model generalizes to a new cohort of loans originated in a different quarter under slightly different underwriting conditions. A random split within Q1 would test whether the model generalizes within the same cohort, which is a much weaker test. Cross-vintage validation is the standard in mortgage research and matches how production models are validated before deployment.
+
+### Why Cox AUC dropped more than logistic AUC
+Cox v3 includes both oltv and current_ltv without the collinearity fix that was applied to logistic (oltv dropped). The in-sample concordance of 0.87 was partly driven by the dual-leverage combination fitting Q1-specific noise. Q2 has slightly different correlation structure between oltv and current_ltv, so Cox lost some of its fit. Logistic, with oltv removed, had no such dependency and transferred cleanly.
+
+### Why S-curve AUC went up out of sample
+This is an unusual result but it has a clean explanation. The S-curve model was fit on a 1M-row sample for speed, so some in-sample noise was absorbed by the 5 parameters. Q2 has a different realization of that noise, and the structural form of the model is correct enough that parameter estimates transferred well. Essentially, the in-sample fit was slightly pessimistic because the noise in the sample pushed the fit away from the true structural relationship. Not a common result but well within expected variation for low-parameter structural models.
